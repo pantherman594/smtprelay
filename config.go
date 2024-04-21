@@ -40,12 +40,9 @@ var (
 	maxMessageSize   = flagset.Int("max_message_size", 10240000, "Max message size in bytes")
 	maxRecipients    = flagset.Int("max_recipients", 100, "Max RCPT TO calls for each envelope")
 	allowedNetsStr   = flagset.String("allowed_nets", "127.0.0.0/8 ::1/128", "Networks allowed to send mails")
-	allowedSenderStr = flagset.String("allowed_sender", "", "Regular expression for valid FROM EMail addresses")
-	allowedRecipStr  = flagset.String("allowed_recipients", "", "Regular expression for valid TO EMail addresses")
 	allowedUsers     = flagset.String("allowed_users", "", "Path to file with valid users/passwords")
-	command          = flagset.String("command", "", "Path to pipe command")
-	remotesStr       = flagset.String("remotes", "", "Outgoing SMTP servers")
 	strictSender     = flagset.Bool("strict_sender", false, "Use only SMTP servers with Sender matches to From")
+	groupsStr        = flagset.String("groups", "", "Configuration group names")
 
 	// additional flags
 	_           = flagset.String("config", "", "Path to config file (ini format)")
@@ -57,9 +54,9 @@ var (
 	writeTimeout      time.Duration
 	dataTimeout       time.Duration
 	allowedNets       = []*net.IPNet{}
-	allowedSender     *regexp.Regexp
-	allowedRecipients *regexp.Regexp
-	remotes           = []*Remote{}
+	groupConfigs      = []*GroupConfigStr{}
+
+	groups = []*GroupConfig{}
 )
 
 func localAuthRequired() bool {
@@ -88,7 +85,7 @@ func setupAllowedNetworks() {
 	}
 }
 
-func setupAllowedPatterns() {
+func setupAllowedPatterns(allowedSenderStr *string, allowedRecipStr *string) (allowedSender *regexp.Regexp, allowedRecipients *regexp.Regexp) {
 	var err error
 
 	if *allowedSenderStr != "" {
@@ -108,9 +105,11 @@ func setupAllowedPatterns() {
 				Fatal("allowed_recipients pattern invalid")
 		}
 	}
+
+	return
 }
 
-func setupRemotes() {
+func setupRemotes(remotesStr *string) (remotes []*Remote) {
 	logger := log.WithField("remotes", *remotesStr)
 
 	if *remotesStr != "" {
@@ -122,6 +121,29 @@ func setupRemotes() {
 
 			remotes = append(remotes, r)
 		}
+	}
+
+	return
+}
+
+func setupGroups() {
+	for _, values := range groupConfigs {
+		group := &GroupConfig{}
+
+		if *values.remotesStr == "" && *values.command == "" {
+			if values.name == "" {
+				log.Warn("no remotes or command set for default group; mail will not be forwarded!")
+			} else {
+				log.Warn(fmt.Sprintf("no remotes or command set for group %s; mail will not be forwarded!", values.name))
+			}
+		}
+
+		group.name = values.name
+		group.allowedSender, group.allowedRecipients = setupAllowedPatterns(values.allowedSenderStr, values.allowedRecipStr)
+		group.command = *values.command
+		group.remotes = setupRemotes(values.remotesStr)
+
+		groups = append(groups, group)
 	}
 }
 
@@ -195,26 +217,63 @@ func setupTimeouts() {
 }
 
 func ConfigLoad() {
+	initialFlagset := flag.NewFlagSet("initial", flag.ContinueOnError)
+	groupNamesStr := initialFlagset.String("groups", "", "Configuration group names")
+
+	// Config file
+	_ = initialFlagset.String("config", "", "")
+
+	// Disable help message
+	_ = initialFlagset.Bool("help", false, "")
+	_ = initialFlagset.Bool("h", false, "")
+
+	var parseOptions []ff.Option
+
 	// use .env file if it exists
 	if _, err := os.Stat(".env"); err == nil {
-		if err := ff.Parse(flagset, os.Args[1:],
+		parseOptions = []ff.Option{
 			ff.WithEnvVarPrefix("smtprelay"),
 			ff.WithConfigFile(".env"),
 			ff.WithConfigFileParser(ff.EnvParser),
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
 		}
 	} else {
 		// use env variables and smtprelay.ini file
-		if err := ff.Parse(flagset, os.Args[1:],
+		parseOptions = []ff.Option{
 			ff.WithEnvVarPrefix("smtprelay"),
 			ff.WithConfigFileFlag("config"),
 			ff.WithConfigFileParser(IniParser),
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
 		}
+	}
+
+	// Parse just the group, so that we can populate the group flags
+	ff.Parse(initialFlagset, os.Args[1:],
+		append(parseOptions, ff.WithIgnoreUndefined(true))...
+	)
+
+	var groupNames []string
+
+	if *groupNamesStr != "" {
+		groupNames = strings.Split(*groupNamesStr, " ")
+
+		// Append an empty group name for the default group.
+		groupNames = append(groupNames, "")
+
+		for _, groupName := range groupNames {
+			config := AppendGroupFlags(flagset, groupName)
+			config.name = groupName
+			groupConfigs = append(groupConfigs, config)
+		}
+	} else {
+		config := AppendGroupFlags(flagset, "")
+		config.name = ""
+		groupConfigs = append(groupConfigs, config)
+
+		_ = AppendGroupFlags(flagset, "[group_name]")
+	}
+
+	if err := ff.Parse(flagset, os.Args[1:], parseOptions...); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Set up logging as soon as possible
@@ -225,13 +284,8 @@ func ConfigLoad() {
 		os.Exit(0)
 	}
 
-	if *remotesStr == "" && *command == "" {
-		log.Warn("no remotes or command set; mail will not be forwarded!")
-	}
-
+	setupGroups()
 	setupAllowedNetworks()
-	setupAllowedPatterns()
-	setupRemotes()
 	setupListeners()
 	setupTimeouts()
 }

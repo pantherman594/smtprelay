@@ -104,14 +104,10 @@ func senderChecker(peer smtpd.Peer, addr string) error {
 		}
 	}
 
-	if allowedSender == nil {
-		// Any sender is permitted
-		return nil
-	}
-
-	if allowedSender.MatchString(addr) {
-		// Permitted by regex
-		return nil
+	for _, group := range groups {
+		if group.senderAllowed(addr) {
+			return nil
+		}
 	}
 
 	log.WithFields(logrus.Fields{
@@ -122,14 +118,10 @@ func senderChecker(peer smtpd.Peer, addr string) error {
 }
 
 func recipientChecker(peer smtpd.Peer, addr string) error {
-	if allowedRecipients == nil {
-		// Any recipient is permitted
-		return nil
-	}
-
-	if allowedRecipients.MatchString(addr) {
-		// Permitted by regex
-		return nil
+	for _, group := range groups {
+		if group.recipientAllowed(addr) {
+			return nil
+		}
 	}
 
 	log.WithFields(logrus.Fields{
@@ -164,86 +156,108 @@ func mailHandler(peer smtpd.Peer, env smtpd.Envelope) error {
 		"uuid": generateUUID(),
 	})
 
-	var envRemotes []*Remote
+	sent := false
 
-	if *strictSender {
-		for _, remote := range remotes {
-			if remote.Sender == env.Sender {
-				envRemotes = append(envRemotes, remote)
-			}
+	for _, group := range groups {
+		if !group.senderAllowed(env.Sender) {
+			continue
 		}
-	} else {
-		envRemotes = remotes
+
+		recipients := group.filterRecipients(env.Recipients)
+		if len(recipients) == 0 {
+			continue
+		}
+
+		groupLogger := logger.WithField("group", group.name).WithField("filtered_to", recipients)
+
+		var envRemotes []*Remote
+
+		if *strictSender {
+			for _, remote := range group.remotes {
+				if remote.Sender == env.Sender {
+					envRemotes = append(envRemotes, remote)
+				}
+			}
+		} else {
+			envRemotes = group.remotes
+		}
+
+		if len(envRemotes) == 0 && group.command == "" {
+			groupLogger.Warning("no remote_host or command set; skipping group")
+			continue
+		}
+
+		env.AddReceivedLine(peer)
+
+		if group.command != "" {
+			cmdLogger := groupLogger.WithField("command", group.command)
+
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+
+			environ := os.Environ()
+			environ = append(environ, fmt.Sprintf("%s=%s", "SMTPRELAY_FROM", env.Sender))
+			environ = append(environ, fmt.Sprintf("%s=%s", "SMTPRELAY_TO", recipients))
+			environ = append(environ, fmt.Sprintf("%s=%s", "SMTPRELAY_PEER", peerIP))
+			environ = append(environ, fmt.Sprintf("%s=%s", "SMTPRELAY_GROUP", group.name))
+
+			cmd := exec.Cmd{
+				Env: environ,
+				Path: group.command,
+			}
+
+			cmd.Stdin = bytes.NewReader(env.Data)
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			err := cmd.Run()
+			if err != nil {
+				cmdLogger.WithError(err).Error(stderr.String())
+				return smtpd.Error{Code: 554, Message: "External command failed"}
+			}
+
+			cmdLogger.Info("pipe command successful: " + stdout.String())
+		}
+
+		for _, remote := range envRemotes {
+			remoteLogger := groupLogger.WithField("host", remote.Addr)
+			remoteLogger.Info("delivering mail from peer using smarthost")
+
+			err := SendMail(
+				remote,
+				env.Sender,
+				recipients,
+				env.Data,
+			)
+			if err != nil {
+				var smtpError smtpd.Error
+
+				switch err := err.(type) {
+				case *textproto.Error:
+					smtpError = smtpd.Error{Code: err.Code, Message: err.Msg}
+
+					remoteLogger.WithFields(logrus.Fields{
+						"err_code": err.Code,
+						"err_msg":  err.Msg,
+					}).Error("delivery failed")
+				default:
+					smtpError = smtpd.Error{Code: 554, Message: "Forwarding failed"}
+
+					remoteLogger.WithError(err).
+						Error("delivery failed")
+				}
+
+				return smtpError
+			}
+
+			remoteLogger.Debug("delivery successful")
+		}
+		sent = true
 	}
 
-	if len(envRemotes) == 0 && *command == "" {
-		logger.Warning("no remote_host or command set; discarding mail")
+	if !sent {
+		logger.Warning("no remote_host or command set for any group; discarding mail")
 		return smtpd.Error{Code: 554, Message: "There are no appropriate remote_host or command"}
-	}
-
-	env.AddReceivedLine(peer)
-
-	if *command != "" {
-		cmdLogger := logger.WithField("command", *command)
-
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-
-		environ := os.Environ()
-		environ = append(environ, fmt.Sprintf("%s=%s", "SMTPRELAY_FROM", env.Sender))
-		environ = append(environ, fmt.Sprintf("%s=%s", "SMTPRELAY_TO", env.Recipients))
-		environ = append(environ, fmt.Sprintf("%s=%s", "SMTPRELAY_PEER", peerIP))
-
-		cmd := exec.Cmd{
-			Env: environ,
-			Path: *command,
-		}
-
-		cmd.Stdin = bytes.NewReader(env.Data)
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-
-		err := cmd.Run()
-		if err != nil {
-			cmdLogger.WithError(err).Error(stderr.String())
-			return smtpd.Error{Code: 554, Message: "External command failed"}
-		}
-
-		cmdLogger.Info("pipe command successful: " + stdout.String())
-	}
-
-	for _, remote := range envRemotes {
-		logger = logger.WithField("host", remote.Addr)
-		logger.Info("delivering mail from peer using smarthost")
-
-		err := SendMail(
-			remote,
-			env.Sender,
-			env.Recipients,
-			env.Data,
-		)
-		if err != nil {
-			var smtpError smtpd.Error
-
-			switch err := err.(type) {
-			case *textproto.Error:
-				smtpError = smtpd.Error{Code: err.Code, Message: err.Msg}
-
-				logger.WithFields(logrus.Fields{
-					"err_code": err.Code,
-					"err_msg":  err.Msg,
-				}).Error("delivery failed")
-			default:
-				smtpError = smtpd.Error{Code: 554, Message: "Forwarding failed"}
-
-				logger.WithError(err).
-					Error("delivery failed")
-			}
-
-			return smtpError
-		}
-
-		logger.Debug("delivery successful")
 	}
 
 	return nil
